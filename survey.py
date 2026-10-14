@@ -97,14 +97,9 @@ LEGACY_QUESTIONNAIRE = [
 
 def question_message(questions, index, answers=None):
     question = questions[index]
-    context = ''
-    if question.get('type') == 'comment' and answers:
-        context = '\n\nВаши оценки в этом разделе:\n' + '\n'.join(
-            f"• {q['text']} — {answer}" for q, answer in zip(questions[:index], answers)
-            if q['section'] == question['section'] and q.get('type') == 'rating')
     return (f"Раздел: {question['section']}\nВопрос {index + 1} из {len(questions)}\n\n"
             + question['text'] + ('\n\nВыберите степень согласия кнопкой. Если опыта недостаточно — «Затрудняюсь ответить».'
-            if question.get('type') == 'rating' else '\n\nНапишите комментарий или нажмите «Не могу оценить».') + context)
+            if question.get('type') == 'rating' else '\n\nНапишите комментарий или нажмите «Пропустить комментарий» под вопросом.') )
 
 
 def answer_keyboard(question):

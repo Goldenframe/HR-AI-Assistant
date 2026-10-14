@@ -17,6 +17,8 @@ from store import Store, MIN_RESPONSES, REMINDER_DELAYS
 from survey import SKIP, question_message, answer_keyboard
 from atlassian import AtlassianMatcher
 from telegram_client import TelegramClient
+from trial import Trial
+from review import AnswerReview
 
 ROOT = Path(__file__).resolve().parent
 FIXTURE = ROOT / 'fixtures' / 'team.json'
@@ -34,6 +36,7 @@ class Bot:
         self.telegram = TelegramClient(token)
         self.callback_acknowledgements = ThreadPoolExecutor(max_workers=1, thread_name_prefix='telegram-ack')
         self.store, self.settings = store, settings
+        self.trial = Trial(store)
         self.reports, self.pending = queue.Queue(), set()
         self.enrollment_attempts = {}
         self.last_dispatch = 0
@@ -58,6 +61,9 @@ class Bot:
             self.api('sendMessage', **payload)
 
     def menu(self, user):
+        if getattr(self, 'trial', None) and self.trial.session(user):
+            self.ask_trial(user)
+            return
         p = self.store.require_profile(user)
         rows = [['Получить обратную связь', 'Оставить отзыв'], ['Мои отчёты', 'Демо']]
         if getattr(self, 'matcher', None):
@@ -69,8 +75,11 @@ class Bot:
         if s:
             questions = self.store.campaign(s['campaign'])['questions']
             answers = json.loads(s['answers'])
+            if len(answers) == len(questions):
+                self.ask_question(user, s['campaign'], len(answers))
+                return
             text += '\n\nУ вас есть незавершённый опрос.\n' + question_message(questions, len(answers), answers)
-            self.send(user, text, answer_keyboard(questions[len(json.loads(s['answers']))]))
+            self.send(user, text, self.question_markup(questions, len(answers), s['campaign']))
             return
         self.send(user, text, {'keyboard': [[{'text': v} for v in row] for row in rows],
                               'resize_keyboard': True, 'is_persistent': True})
@@ -220,11 +229,25 @@ class Bot:
         rows.append([('К опросу', 'status:' + token)])
         self.send(user, 'Просмотр исходных ответов:', inline(rows))
 
+    def question_markup(self, questions, index, token, slot=None):
+        if questions[index].get('type') == 'rating':
+            return answer_keyboard(questions[index])
+        suffix = f'{token}:{slot}:{index}' if slot is not None else f'{token}:{index}'
+        mode = 'trial' if slot is not None else 'answer'
+        return inline([[('Пропустить комментарий', f'skip{mode}:{suffix}')],
+                       [('Отменить ответ', f'cancel{mode}:{suffix}')]])
+
     def ask_question(self, user, token, index):
         questions = self.store.campaign(token)['questions']
         session = self.store.session(user)
         answers = json.loads(session['answers']) if session else []
-        self.send(user, question_message(questions, index, answers), answer_keyboard(questions[index]))
+        if session and session.get('edit_index') is not None:
+            index = session['edit_index']
+        elif len(answers) == len(questions):
+            self.review_summary(user, token)
+            return
+        prefix = ('Изменение ответа\nТекущий ответ: ' + answers[index] + '\n\n') if session and session.get('edit_index') is not None else ''
+        self.send(user, prefix + question_message(questions, index, answers), self.question_markup(questions, index, token))
 
     def campaign_label(self, campaign, include_subject=False):
         created = datetime.fromisoformat(campaign['created']).replace(tzinfo=timezone.utc)
@@ -297,6 +320,100 @@ class Bot:
                             ('resume:' if resume else 'accept:') + token)],
                           [('Не участвовать', 'decline:' + token)], [('Напомнить позже', 'remind:' + token)]]))
 
+    def ask_trial(self, user):
+        session = self.trial.session(user)
+        run = self.trial.run(user, session['run'])
+        answers = json.loads(session['answers'])
+        index = session['edit_index'] if session.get('edit_index') is not None else len(answers)
+        if index == len(run['questions']):
+            self.review_summary(user, session['run'], session['slot'])
+            return
+        prefix = ('Изменение ответа\nТекущий ответ: ' + answers[index] + '\n\n') if session.get('edit_index') is not None else ''
+        self.send(user, f"ТЕСТ · отзыв участника №{session['slot']}\nО сотруднике: {run['subject']}\n\n"
+                  + prefix + question_message(run['questions'], index, answers),
+                  self.question_markup(run['questions'], index, session['run'], session['slot']))
+
+    def review_summary(self, user, token, slot=None):
+        mode = 't' if slot is not None else 'n'
+        arg = f'{mode}:{token}:{slot or 0}:0'
+        self.send(user, ('ТЕСТ · ' if slot is not None else '') + 'Анкета заполнена.\n'
+                  'Можно просмотреть и изменить ответы. Отзыв попадёт в отчёт после нажатия «Отправить отзыв».',
+                  inline([[('Просмотреть мои ответы', 'rvview:' + arg)],
+                          [('Отправить отзыв', 'rvsubmit:' + arg)], [('Отменить ответ', 'rvcancel:' + arg)]]))
+
+    def review_view(self, user, token, slot=None, index=0, listing=False, message_id=None):
+        helper = AnswerReview(self.store, getattr(self, 'trial', None))
+        _, run, answers = helper.context(user, token, slot)
+        mode = 't' if slot is not None else 'n'
+        def callback(action, value): return f'{action}:{mode}:{token}:{slot or 0}:{value}'
+        index = max(0, min(index, len(answers) - 1))
+        rows = []
+        if listing:
+            start = (index // 8) * 8
+            text = 'Выберите ответ для просмотра или изменения:'
+            rows = [[(f"№{i+1} · {run['questions'][i]['text'][:48]}", callback('rvview',i))]
+                    for i in range(start, min(start+8,len(answers)))]
+            previous, following = start-8, start+8
+        else:
+            q = run['questions'][index]
+            text = f"Мои ответы · {index+1} из {len(answers)}\nРаздел: {q['section']}\n\n{q['text']}\n\nВаш ответ:\n{answers[index]}"
+            rows = [[('Изменить этот ответ', callback('rvedit',index))], [('Список вопросов', callback('rvlist',index))]]
+            previous, following = index-1, index+1
+        navigation = []
+        if previous >= 0: navigation.append(('← Назад', callback('rvlist' if listing else 'rvview',previous)))
+        if following < len(answers): navigation.append(('Далее →', callback('rvlist' if listing else 'rvview',following)))
+        if navigation:rows.append(navigation)
+        rows.append([('Отправить отзыв', callback('rvsubmit',0))])
+        if message_id is not None:self.api('editMessageText', chat_id=user, message_id=message_id, text=text, reply_markup=inline(rows))
+        else:self.send(user,text,inline(rows))
+
+    def feedback_submitted(self, user, token, slot=None):
+        if slot is not None:
+            count = len(self.trial.answers(token))
+            self.send(user, f'Тестовый отзыв №{slot} отправлен. Завершено: {count} из 2.')
+            if count == 2:
+                self.send(user, 'Оба отзыва получены. Готовлю тестовый отчёт через корпоративный ИИ.')
+                self.dispatch_trial_reports()
+            else:
+                other = 2 if slot == 1 else 1
+                self.send(user, 'Теперь заполните отзыв за второго тестового участника.',
+                          inline([[('Начать второй отзыв', f'trial:{token}:{other}')]]))
+        else:
+            self.send(user, 'Спасибо! Отзыв отправлен. Сотрудник и HR смогут посмотреть отчёт и исходные ответы без имени автора.')
+        self.menu(user)
+
+    def dispatch_trial_reports(self):
+        for run in self.trial.ready():
+            pending_key = 'trial:' + run['id']
+            if pending_key in self.pending or len(self.pending) >= 2:
+                continue
+            self.pending.add(pending_key)
+            self.trial.attempted(run['id'])
+            def worker(run=run, pending_key=pending_key):
+                try:
+                    questions = json.loads(run['questions'])
+                    answers = self.trial.answers(run['id'])
+                    report = json.loads(run['report']) if run['report'] else generate_report(answers, self.settings, questions=questions)
+                    self.trial.save_report(run['id'], report)
+                    text = 'ТЕСТ · два отзыва заполнены одним человеком в разных ролях.\n\n' + format_report(
+                        {'subject':run['subject'], 'demo':False}, report, 2, 'employee', 2)
+                    self.reports.put((pending_key,run['owner'],text))
+                except Exception as exc:
+                    self.pending.discard(pending_key)
+                    detail = str(exc) if isinstance(exc, UserError) else 'Не удалось обработать ответ корпоративного ИИ.'
+                    if any(f'HTTP {code}.' in detail for code in (500,502,503,504)):
+                        detail = 'Сервер корпоративного ИИ временно недоступен.'
+                    print('Тестовый отчёт: ' + detail)
+                    if self.trial.record_error(run['id'], detail):
+                        try:
+                            self.send(run['owner'], 'Оба тестовых отзыва сохранены.\n' + detail + '\n'
+                                      'Отчёт остаётся в очереди. Бот повторит запрос автоматически и пришлёт результат, '
+                                      'когда ИИ заработает. Заполнять отзывы заново не нужно.',
+                                      inline([[('Повторить запрос сейчас', 'trialreport:' + run['id'])]]))
+                        except UserError:
+                            pass
+            threading.Thread(target=worker, daemon=True).start()
+
     def request_report(self, user, token):
         c, answers = self.store.report_data(user, token)
         role = self.store.require_profile(user)['role']
@@ -341,7 +458,58 @@ class Bot:
         if action in ('pick', 'pickall', 'select', 'add', 'toggle', 'all', 'none', 'discard', 'launch'):
             self.store.metadata('colleague-search:' + str(user), '')
             self.store.metadata('colleague-search-message:' + str(user), '')
-        if action == 'menu':
+        if action in ('rvview','rvlist','rvedit','rvsubmit','rvcancel'):
+            parts = arg.split(':')
+            if len(parts) != 4 or parts[0] not in ('t','n') or not parts[2].isdigit() or not parts[3].isdigit():
+                raise UserError('Неизвестный ответ.')
+            mode, token, slot_value, index_value = parts
+            slot = int(slot_value) if mode == 't' else None
+            index = int(index_value)
+            helper = AnswerReview(self.store, getattr(self, 'trial', None))
+            helper.context(user, token, slot)
+            if action == 'rvsubmit':
+                helper.submit(user, token, slot)
+                self.feedback_submitted(user, token, slot)
+            elif action == 'rvcancel':
+                (self.trial if slot is not None else self.store).cancel(user)
+                self.send(user, 'Черновик отзыва отменён и не попадёт в отчёт.')
+                self.menu(user)
+            elif action == 'rvedit':
+                helper.edit(user, token, index, slot)
+                if slot is not None:self.ask_trial(user)
+                else:self.ask_question(user,token,index)
+            else:
+                table = 'trial_sessions' if slot is not None else 'sessions'
+                with self.store.connect() as db:db.execute(f'UPDATE {table} SET edit_index=NULL WHERE user=?',(user,))
+                self.review_view(user,token,slot,index,action=='rvlist',message_id)
+        elif action in ('skipanswer', 'cancelanswer', 'skiptrial', 'canceltrial'):
+            parts = arg.split(':')
+            is_trial = action.endswith('trial')
+            session = self.trial.session(user) if is_trial else self.store.session(user)
+            expected = 3 if is_trial else 2
+            if len(parts) != expected or not parts[-1].isdigit() or not session:
+                raise UserError('Этот вопрос уже пройден. Продолжите текущий отзыв.')
+            token, index = parts[0], int(parts[-1])
+            questions = (self.trial.run(user, token) if is_trial else self.store.campaign(token))['questions']
+            active_token = session['run'] if is_trial else session['campaign']
+            if (active_token != token or index != (session['edit_index'] if session.get('edit_index') is not None else len(json.loads(session['answers'])))
+                    or index >= len(questions) or questions[index].get('type') == 'rating'
+                    or (is_trial and parts[1] != str(session['slot']))):
+                raise UserError('Этот вопрос уже пройден. Продолжите текущий отзыв.')
+            self.handle({'chat': {'type': 'private'}, 'from': {'id': user},
+                         'text': SKIP if action.startswith('skip') else '/cancel'})
+        elif action == 'trial':
+            token, _, slot = arg.partition(':')
+            if not slot.isdigit():
+                raise UserError('Неизвестный участник теста.')
+            self.trial.begin(user, token, int(slot))
+            self.ask_trial(user)
+        elif action == 'trialreport':
+            self.trial.retry(user, arg)
+            self.dispatch_trial_reports()
+        elif getattr(self, 'trial', None) and self.trial.session(user):
+            raise UserError('Сначала завершите тестовый отзыв или нажмите «Отменить ответ».')
+        elif action == 'menu':
             self.menu(user)
         elif action == 'new':
             self.draft(user, arg or None)
@@ -466,6 +634,20 @@ class Bot:
                     self.store.metadata('invite:' + str(user), '')
                     self.consent(user, invite)
                 return
+            if getattr(self, 'trial', None) and self.trial.session(user):
+                if text == 'Отменить ответ' or command == '/cancel':
+                    self.trial.cancel(user)
+                    self.send(user, 'Незавершённый тестовый ответ отменён.')
+                    self.menu(user)
+                elif command in ('/start', '/help'):
+                    self.ask_trial(user)
+                else:
+                    result = self.trial.answer(user, text, message.get('message_id'), review=True)
+                    if result:
+                        token, slot, step = result
+                        run = self.trial.run(user, token)
+                        self.ask_trial(user)
+                return
             search = self.store.metadata('colleague-search:' + str(user))
             if search:
                 self.store.metadata('colleague-search:' + str(user), '')
@@ -525,13 +707,11 @@ class Bot:
                 self.send(user, 'Откройте меню командой /start.')
             else:
                 session = self.store.session(user)
-                step = self.store.answer(user, text, message.get('message_id'))
+                step = self.store.answer(user, text, message.get('message_id'), review=True)
                 if step is None:
                     self.send(user, 'Выберите действие кнопкой меню или отправьте /start.')
                 elif session and step == len(self.store.campaign(session['campaign'])['questions']):
-                    self.send(user, 'Спасибо! Отзыв сохранён. Сотрудник и HR получат отчёт и смогут '
-                              'посмотреть исходные ответы без имени автора.')
-                    self.menu(user)
+                    self.review_summary(user, session['campaign'])
                 else:
                     if session:
                         self.ask_question(user, session['campaign'], step)
@@ -575,11 +755,14 @@ class Bot:
                 if time.monotonic() - self.last_dispatch >= 30:
                     self.dispatch_invitations()
                     self.dispatch_reminders()
+                    self.dispatch_trial_reports()
                     self.last_dispatch = time.monotonic()
                 while not self.reports.empty():
                     token, user, text = self.reports.get()
                     self.pending.discard(token)
                     self.send(user, text)
+                    if token.startswith('trial:'):
+                        self.trial.delivered(token[6:])
                 while not self.match_results.empty():
                     user, token, error = self.match_results.get()
                     self.match_pending.discard(user)

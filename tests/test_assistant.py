@@ -233,6 +233,8 @@ class AssistantTests(unittest.TestCase):
         bot.action(user, 'accept', token)
         for i, text in enumerate(DEMO_ANSWERS[0], 10):
             message(user, text, i)
+        self.assertEqual(self.store.responses(token), [])
+        bot.action(user, 'rvsubmit', 'n:' + token + ':0:0')
         self.assertEqual(len(self.store.responses(token)), 1)
 
     def test_demo_does_not_send_invites_and_cache_invalidates_on_count_change(self):
@@ -311,10 +313,25 @@ class AssistantTests(unittest.TestCase):
                         'text': text, 'message_id': i})
         self.assertEqual(self.store.responses(token), [])
         self.assertEqual(len(json.loads(self.store.session(user)['answers'])), 49)
-        self.assertEqual(bot.sent[-1][2]['keyboard'][0][0]['text'], SKIP)
+        self.assertEqual(bot.sent[-1][2]['inline_keyboard'][0][0]['text'], 'Пропустить комментарий')
         bot.handle({'chat': {'id': user, 'type': 'private'}, 'from': {'id': user},
                     'text': SKIP, 'message_id': 50})
+        bot.action(user, 'rvsubmit', 'n:' + token + ':0:0')
         self.assertEqual(len(self.store.responses(token)[0]), 50)
+
+    def test_inline_comment_skip_advances_once_and_rejects_old_question_button(self):
+        bot = self.fake_bot()
+        token = self.create_open()
+        user = self.users['e02']
+        bot.action(user, 'accept', token)
+        self.store.answer(user, RATINGS[0])
+        bot.ask_question(user, token, 1)
+        self.assertEqual(bot.sent[-1][2]['inline_keyboard'][0][0]['text'], 'Пропустить комментарий')
+        bot.action(user, 'skipanswer', token + ':1')
+        self.assertEqual(json.loads(self.store.session(user)['answers']), [RATINGS[0], SKIP])
+        with self.assertRaises(UserError):
+            bot.action(user, 'skipanswer', token + ':1')
+        self.assertEqual(len(json.loads(self.store.session(user)['answers'])), 2)
 
     def test_rating_evidence_and_computed_distribution(self):
         answers = [[RATINGS[-1] if q['type'] == 'rating' else SKIP for q in QUESTIONNAIRE] for _ in range(3)]

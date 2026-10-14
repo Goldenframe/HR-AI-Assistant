@@ -54,6 +54,8 @@ class Store:
             employee_columns = {r['name'] for r in db.execute('PRAGMA table_info(employees)')}
             if 'enabled' not in employee_columns:
                 db.execute('ALTER TABLE employees ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1')
+            if 'edit_index' not in {r['name'] for r in db.execute('PRAGMA table_info(sessions)')}:
+                db.execute('ALTER TABLE sessions ADD COLUMN edit_index INTEGER')
             campaign_columns = {r['name'] for r in db.execute('PRAGMA table_info(campaigns)')}
             if 'questionnaire' not in campaign_columns:
                 db.execute('ALTER TABLE campaigns ADD COLUMN questionnaire TEXT')
@@ -396,7 +398,7 @@ class Store:
         with self.connect() as db:
             if db.execute('SELECT 1 FROM sessions WHERE user=?', (user,)).fetchone():
                 raise UserError('У вас есть незавершённый опрос. Продолжите его или нажмите «Отменить ответ».')
-            db.execute('INSERT INTO sessions VALUES(?,?,?)', (user, token, '[]'))
+            db.execute('INSERT INTO sessions(user,campaign,answers) VALUES(?,?,?)', (user, token, '[]'))
             db.execute('DELETE FROM reminders WHERE campaign=? AND employee=?', (token, self.require_profile(user)['id']))
         return c
 
@@ -409,7 +411,7 @@ class Store:
         with self.connect() as db:
             db.execute('DELETE FROM sessions WHERE user=?', (user,))
 
-    def answer(self, user, text, message_id=None):
+    def answer(self, user, text, message_id=None, review=False):
         profile = self.require_profile(user)
         with self.connect() as db:
             if message_id is not None:
@@ -424,18 +426,25 @@ class Store:
                 raise UserError('Ответ должен содержать от 2 до 1200 символов.')
             questions = self.campaign(session['campaign'])['questions']
             previous = json.loads(session['answers'])
-            if questions[len(previous)].get('type') == 'rating' and text.strip() not in RATINGS:
+            index = session['edit_index'] if session['edit_index'] is not None else len(previous)
+            if index >= len(questions):
+                raise UserError('Анкета заполнена. Проверьте ответы и нажмите «Отправить отзыв».')
+            if questions[index].get('type') == 'rating' and text.strip() not in RATINGS:
                 raise UserError('Выберите оценку кнопкой: ' + ', '.join(RATINGS) + '.')
-            answers = previous + [text.strip()]
+            answers = previous.copy()
+            if session['edit_index'] is not None:
+                answers[index] = text.strip()
+            else:
+                answers.append(text.strip())
             step = len(answers)
             question_count = len(questions)
-            if step == question_count:
+            if step == question_count and not review:
                 db.execute('INSERT INTO responses VALUES(?,?,?)',
                            (session['campaign'], profile['id'], json.dumps(answers, ensure_ascii=False)))
                 db.execute('DELETE FROM sessions WHERE user=?', (user,))
                 db.execute('DELETE FROM reminders WHERE campaign=? AND employee=?', (session['campaign'], profile['id']))
             else:
-                db.execute('UPDATE sessions SET answers=? WHERE user=?',
+                db.execute('UPDATE sessions SET answers=?,edit_index=NULL WHERE user=?',
                            (json.dumps(answers, ensure_ascii=False), user))
             if message_id is not None:
                 db.execute('INSERT INTO receipts VALUES(?,?,?)', (user, message_id, step))
