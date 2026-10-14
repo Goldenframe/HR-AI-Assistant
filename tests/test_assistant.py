@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ai import DEMO_ANSWERS, PREVIOUS_DEMO_ANSWERS, format_report, validate_report, generate_report, add_rating_summary_if_empty
+from ai import REPORT_VERSION, DEMO_ANSWERS, PREVIOUS_DEMO_ANSWERS, format_report, validate_report, generate_report, add_rating_summary_if_empty
 from bot import Bot, FIXTURE
 from helpers import UserError
 from store import Store
@@ -117,8 +117,8 @@ class AssistantTests(unittest.TestCase):
     def test_ai_payload_preserves_explicit_question_numbers_when_skips_are_removed(self):
         answer = [RATINGS[-1] if q['type'] == 'rating' else SKIP for q in QUESTIONNAIRE]
         answer[-1] = 'Рекомендую предупреждать о рисках раньше.'
-        parsed = {'strengths': [], 'development': [], 'contradictions': [], 'advice': [
-            {'theme': 'Предупреждать о рисках раньше', 'evidence': [
+        parsed = {'version': REPORT_VERSION, 'strengths': [], 'development': [], 'contradictions': [], 'advice': [
+            {'theme': 'Предупреждать о рисках раньше', 'explanation': 'Коллега предлагает заранее сообщать о задержках.', 'evidence': [
                 {'response': 1, 'question': 50, 'quote': answer[-1]}]}]}
         with patch('ai.request_json', return_value={'choices': [{'message': {'content': json.dumps(parsed)}}]}) as fetch:
             report = generate_report([answer], ('http://local', 'fake-key', 'fake-model'))
@@ -213,7 +213,7 @@ class AssistantTests(unittest.TestCase):
         hr = format_report(c, report, 3, 'hr', 5)
         self.assertIn('Недостаточно конкретных', employee)
         self.assertNotIn('Завершение:', employee)
-        self.assertIn('Завершение: 60%', hr)
+        self.assertIn('Завершение: 3 из 5', hr)
 
     def test_buttons_consent_and_completion_flow(self):
         bot = self.fake_bot()
@@ -245,12 +245,13 @@ class AssistantTests(unittest.TestCase):
         with self.assertRaises(UserError):
             self.store.begin(self.users['e02'], token)
         report = {'strengths': [], 'development': [], 'advice': [], 'contradictions': []}
+        report['_version'] = REPORT_VERSION
         self.store.save_report(token, 3, report)
         self.assertEqual(self.store.cached_report(token, 3), report)
         self.assertIsNone(self.store.cached_report(token, 4))
         bot.request_report(self.owner, token)
         self.assertEqual(len(bot.sent), 1)
-        self.assertIn('ДЕМОНСТРАЦИЯ', bot.sent[0][1])
+        self.assertIn('Тестовый отчёт', bot.sent[0][1])
 
     def test_invitations_are_automatic_no_links_or_manual_resending(self):
         bot = self.fake_bot()

@@ -220,11 +220,18 @@ class FeedbackOptionsTests(unittest.TestCase):
 
     def test_original_answers_access_threshold_comments_and_no_ai_call(self):
         token = self.store.demo(self.owner, DEMO_ANSWERS)
+        from types import SimpleNamespace
+        from io import BytesIO
+        from zipfile import ZipFile
+        files = []
+        self.bot.telegram = SimpleNamespace(send_document=lambda *args: files.append(args))
         self.bot.show_answers(self.owner, token, comments=True)
-        self.assertIn(DEMO_ANSWERS[0][1], self.sent[0][1])
-        self.assertIn('Отзыв №1', self.sent[0][1])
-        self.assertNotIn('Мария Иванова', self.sent[0][1])
-        self.assertTrue(any(row[0]['text'] == 'Все вопросы' for row in self.sent[-1][2]['inline_keyboard']))
+        with ZipFile(BytesIO(files[0][1])) as workbook:
+            text = workbook.read('xl/worksheets/sheet1.xml').decode('utf8')
+        self.assertIn(DEMO_ANSWERS[0][1], text)
+        self.assertIn('Отзыв', text)
+        self.assertNotIn('Мария Иванова', text)
+        self.assertTrue(files[0][2].endswith('.xlsx'))
         with self.assertRaises(UserError):
             self.bot.show_answers(self.users['e02'], token)
         self.bot.show_answers(self.users['hr01'], token)

@@ -3,6 +3,8 @@ import http.client
 import json
 import os
 import threading
+import secrets
+import urllib.request
 
 from helpers import UserError, request_json
 
@@ -58,3 +60,33 @@ class TelegramClient:
             self.close()
             # Never retry a send here: an ambiguous network failure can follow successful delivery.
             raise UserError('Не удалось связаться с Telegram. Проверьте интернет; при необходимости включите TELEGRAM_USE_PROXY=1.') from None
+
+    def send_document(self, chat, content, filename, caption=''):
+        boundary = 'feedback-' + secrets.token_hex(16)
+        chunks = []
+        for name,value in (('chat_id',str(chat)),('caption',caption)):
+            chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode('utf-8'))
+        safe_name = filename.replace('"','').replace('\r','').replace('\n','')
+        chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{safe_name}"\r\n'
+                       'Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n').encode())
+        chunks.extend([content, f'\r\n--{boundary}--\r\n'.encode()])
+        body = b''.join(chunks)
+        headers = {'Content-Type':f'multipart/form-data; boundary={boundary}'}
+        connection = None
+        try:
+            if self.use_proxy:
+                request = urllib.request.Request('https://api.telegram.org/bot'+self.token+'/sendDocument',data=body,headers=headers)
+                with urllib.request.urlopen(request,timeout=30) as response:data=json.load(response)
+            else:
+                connection=self.connection_factory('api.telegram.org',timeout=30)
+                connection.request('POST','/bot'+self.token+'/sendDocument',body=body,headers=headers)
+                response=connection.getresponse()
+                data=json.loads(response.read())
+                if response.status>=400:raise UserError(f'Telegram вернул HTTP {response.status} при отправке файла.')
+            if not data.get('ok'):raise UserError('Telegram не принял Excel-файл.')
+            return data['result']
+        except UserError:raise
+        except (OSError,http.client.HTTPException,ValueError,UnicodeDecodeError):
+            raise UserError('Не удалось отправить Excel через Telegram. Попробуйте кнопку ещё раз.') from None
+        finally:
+            if connection:connection.close()

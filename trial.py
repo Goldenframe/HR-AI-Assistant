@@ -37,7 +37,7 @@ class Trial:
         with self.store.connect() as db:
             row=db.execute('SELECT * FROM trial_runs WHERE id=? AND owner=?',(token,user)).fetchone()
         if not row:
-            raise UserError('Этот тест доступен только его участнику.')
+            raise UserError('Этот тест завершён или недоступен вашему профилю.')
         result=dict(row);result['questions']=json.loads(result['questions']);return result
 
     def session(self, user):
@@ -111,4 +111,4 @@ class Trial:
 
     def retry(self,user,token):
         self.run(user,token)
-        with self.store.connect() as db:db.execute('UPDATE trial_runs SET attempts=0,next_attempt=0 WHERE id=? AND delivered=0',(token,))
+        with self.store.connect() as db:db.execute('UPDATE trial_runs SET attempts=0,next_attempt=0,delivered=0 WHERE id=?',(token,))

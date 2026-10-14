@@ -11,7 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from ai import DEMO_ANSWERS, generate_report, format_report
+from ai import DEMO_ANSWERS, generate_report, format_report, REPORT_VERSION
 from helpers import UserError, ai_settings, load_local_env, save_bot_token
 from store import Store, MIN_RESPONSES, REMINDER_DELAYS
 from survey import SKIP, question_message, answer_keyboard
@@ -19,6 +19,8 @@ from atlassian import AtlassianMatcher
 from telegram_client import TelegramClient
 from trial import Trial
 from review import AnswerReview
+from xlsx_export import export_answers
+from workload import jira_workload, unavailable
 
 ROOT = Path(__file__).resolve().parent
 FIXTURE = ROOT / 'fixtures' / 'team.json'
@@ -202,32 +204,15 @@ class Bot:
             except UserError:
                 self.store.reminder_failed(token, reminder['employee'], reminder['due'])
 
+    def send_answers_excel(self, user, subject, questions, answers, filename):
+        content = export_answers(subject, questions, answers)
+        self.telegram.send_document(user, content, filename,
+            f"Исходные отзывы о сотруднике: {subject}. Отзывов: {len(answers)}. Авторы обозначены номерами.")
+
     def show_answers(self, user, token, index=0, comments=False):
-        c, answers = self.store.report_data(user, token)
-        questions = c['questions']
-        indices = [i for i, q in enumerate(questions) if not comments or q.get('type') != 'rating']
-        if index not in indices:
-            index = indices[0]
-        question = questions[index]
-        text = ('ДЕМО · вымышленные ответы\n' if c['demo'] else '')
-        text += (f"Исходные ответы о сотруднике: {c['subject']}\nРаздел: {question['section']}\n"
-                 f"Вопрос {index + 1} из {len(questions)}: {question['text']}\n\n"
-                 'Номера отзывов не раскрывают профили авторов. Текст приводится без обработки ИИ.\n')
-        for number, response in enumerate(answers, 1):
-            text += f'\nОтзыв №{number}:\n{response[index]}\n'
-        self.send(user, text)
-        position = indices.index(index)
-        prefix = 'comments' if comments else 'answers'
-        navigation = []
-        if position:
-            navigation.append(('← Предыдущий', f'{prefix}:{token}:{indices[position - 1]}'))
-        if position + 1 < len(indices):
-            navigation.append(('Следующий →', f'{prefix}:{token}:{indices[position + 1]}'))
-        rows = [navigation] if navigation else []
-        rows.append([('Все вопросы' if comments else 'Только комментарии',
-                      ('answers:' if comments else 'comments:') + token)])
-        rows.append([('К опросу', 'status:' + token)])
-        self.send(user, 'Просмотр исходных ответов:', inline(rows))
+        campaign, answers = self.store.report_data(user, token)
+        self.send_answers_excel(user, campaign['subject'], campaign['questions'], answers,
+                                f"feedback_answers_{campaign['number']}.xlsx")
 
     def question_markup(self, questions, index, token, slot=None):
         if questions[index].get('type') == 'rating':
@@ -280,7 +265,7 @@ class Bot:
         rows = []
         if c['state'] == 'open' and count >= MIN_RESPONSES:
             rows.append([('Получить отчёт', 'report:' + token)])
-            rows.append([('Ответы коллег', 'answers:' + token)])
+            rows.append([('Ответы коллег — Excel', 'answers:' + token)])
         if c['state'] == 'draft' and (c['requester'] == user or self.store.profile(user)['role'] == 'hr'):
             rows.append([('Выбрать коллег', 'select:' + token), ('Отменить', 'discard:' + token)])
         rows.append([('Обновить статистику', 'status:' + token)])
@@ -382,6 +367,12 @@ class Bot:
             self.send(user, 'Спасибо! Отзыв отправлен. Сотрудник и HR смогут посмотреть отчёт и исходные ответы без имени автора.')
         self.menu(user)
 
+    def show_trial_answers(self, user, token, index=0, message_id=None):
+        run = self.trial.run(user, token)
+        answers = self.trial.answers(token)
+        if len(answers) != 2:raise UserError('Сначала завершите и отправьте оба тестовых отзыва.')
+        self.send_answers_excel(user, run['subject'], run['questions'], answers, 'test_feedback_answers.xlsx')
+
     def dispatch_trial_reports(self):
         for run in self.trial.ready():
             pending_key = 'trial:' + run['id']
@@ -393,9 +384,11 @@ class Bot:
                 try:
                     questions = json.loads(run['questions'])
                     answers = self.trial.answers(run['id'])
-                    report = json.loads(run['report']) if run['report'] else generate_report(answers, self.settings, questions=questions)
+                    report = json.loads(run['report']) if run['report'] else None
+                    if not report or report.get('_version') != REPORT_VERSION:
+                        report = generate_report(answers, self.settings, questions=questions)
                     self.trial.save_report(run['id'], report)
-                    text = 'ТЕСТ · два отзыва заполнены одним человеком в разных ролях.\n\n' + format_report(
+                    text = 'ТЕСТ · две роли одного участника.\n\n' + format_report(
                         {'subject':run['subject'], 'demo':False}, report, 2, 'employee', 2)
                     self.reports.put((pending_key,run['owner'],text))
                 except Exception as exc:
@@ -414,12 +407,22 @@ class Bot:
                             pass
             threading.Thread(target=worker, daemon=True).start()
 
+    def report_workload(self, target, demo=False):
+        matcher = getattr(self, 'matcher', None)
+        if demo or matcher is None:
+            return unavailable('test_or_not_configured')
+        try:
+            return jira_workload(matcher, target)
+        except Exception:
+            # Optional Jira context must never block feedback delivery or expose credentials.
+            return unavailable()
+
     def request_report(self, user, token):
         c, answers = self.store.report_data(user, token)
         role = self.store.require_profile(user)['role']
         _, invited, _ = self.store.stats(user, token)
         report = self.store.cached_report(token, len(answers))
-        if report:
+        if c['demo'] and report and report.get('_version') == REPORT_VERSION:
             self.send(user, format_report(c, report, len(answers), role, invited))
             return
         if token in self.pending:
@@ -430,9 +433,13 @@ class Bot:
         self.pending.add(token)
         def worker():
             try:
-                report = generate_report(answers, self.settings, questions=c['questions'])
-                self.store.save_report(token, len(answers), report)
-                text = format_report(c, report, len(answers), role, invited)
+                workload = self.report_workload(c['target'], c['demo'])
+                if not report or report.get('_version') != REPORT_VERSION or report.get('_workload') != workload:
+                    current_report = generate_report(answers, self.settings, questions=c['questions'], workload=workload)
+                else:
+                    current_report = report
+                self.store.save_report(token, len(answers), current_report)
+                text = format_report(c, current_report, len(answers), role, invited)
             except UserError as exc:
                 text = str(exc)
             except Exception:
@@ -504,6 +511,9 @@ class Bot:
                 raise UserError('Неизвестный участник теста.')
             self.trial.begin(user, token, int(slot))
             self.ask_trial(user)
+        elif action == 'trialanswers':
+            token, _, index = arg.partition(':')
+            self.show_trial_answers(user,token,int(index) if index.isdigit() else 0,message_id)
         elif action == 'trialreport':
             self.trial.retry(user, arg)
             self.dispatch_trial_reports()
@@ -760,7 +770,8 @@ class Bot:
                 while not self.reports.empty():
                     token, user, text = self.reports.get()
                     self.pending.discard(token)
-                    self.send(user, text)
+                    markup = inline([[('Ответы коллег — Excel', 'trialanswers:' + token[6:] + ':0')]]) if token.startswith('trial:') else None
+                    self.send(user, text, markup)
                     if token.startswith('trial:'):
                         self.trial.delivered(token[6:])
                 while not self.match_results.empty():

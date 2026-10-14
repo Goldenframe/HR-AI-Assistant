@@ -50,7 +50,7 @@ class TrialTests(unittest.TestCase):
             token,user,text=bot.reports.get(timeout=5)
             self.assertEqual(user,123)
             self.assertEqual(token,'trial:'+self.token)
-            self.assertIn('Получено отзывов: 2',text)
+            self.assertIn('На основе 2 отзывов',text)
             self.assertEqual(len(analysis.call_args.args[0]),2)
             self.assertIsNotNone(self.trial.run(123,self.token)['report'])
         self.trial.delivered(self.token)
