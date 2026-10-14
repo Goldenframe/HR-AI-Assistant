@@ -1,0 +1,13 @@
+{
+  "description": "Замените пример реальными профилями и ключами. Не коммитьте заполненный файл; сохраните в data/corporate-team.json.",
+  "employees": [
+    {"id": "person01", "name": "Сотрудник 1", "role": "employee", "jira_user": "<логин Jira>", "confluence_user": "<логин Confluence>"},
+    {"id": "person02", "name": "Сотрудник 2", "role": "employee", "jira_user": "<логин Jira>", "confluence_user": "<логин Confluence>"},
+    {"id": "person03", "name": "Сотрудник 3", "role": "employee", "jira_user": "<логин Jira>", "confluence_user": "<логин Confluence>"},
+    {"id": "person04", "name": "Сотрудник 4", "role": "employee", "jira_user": "<логин Jira>", "confluence_user": "<логин Confluence>"},
+    {"id": "hr01", "name": "HR", "role": "hr"}
+  ],
+  "projects": [
+    {"id": "PROJECT", "name": "Название проекта", "spaces": ["<ключ пространства Confluence>"]}
+  ]
+}

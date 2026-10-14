@@ -3,13 +3,14 @@ from pathlib import Path
 import queue
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from ai import DEMO_ANSWERS, format_report, validate_report
+from ai import DEMO_ANSWERS, PREVIOUS_DEMO_ANSWERS, format_report, validate_report, generate_report, add_rating_summary_if_empty
 from bot import Bot, FIXTURE
 from helpers import UserError
 from store import Store
-from survey import QUESTIONS, QUESTIONNAIRE, LEGACY_QUESTIONNAIRE, SKIP
+from survey import QUESTIONS, QUESTIONNAIRE, LEGACY_QUESTIONNAIRE, PREVIOUS_QUESTIONNAIRE, RATINGS, SKIP
 
 
 class AssistantTests(unittest.TestCase):
@@ -42,27 +43,100 @@ class AssistantTests(unittest.TestCase):
         bot.store, bot.username, bot.settings = self.store, 'example_bot', ('http://localhost', 'dummy', 'dummy')
         bot.reports, bot.pending = queue.Queue(), set()
         bot.enrollment_attempts = {}
+        bot.matcher, bot.match_results, bot.match_pending = None, queue.Queue(), set()
         bot.sent = []
         bot.send = lambda user, text, markup=None: bot.sent.append((user, text, markup))
         bot.api = lambda *args, **kwargs: True
         return bot
 
-    def test_employee_selects_colleagues_including_people_without_common_projects(self):
+    def test_colleagues_are_automatically_selected_from_shared_projects(self):
         token, candidates = self.store.create(self.owner)
-        self.assertEqual(self.store.invitations(token), [])
-        self.assertIn('e09', {c['id'] for c in candidates})
+        self.assertEqual({i['employee'] for i in self.store.invitations(token)}, {'e02', 'e03', 'e04', 'e05', 'e06'})
+        self.assertEqual(candidates[0]['id'], 'e02')
+        self.assertEqual(len(candidates[0]['projects']), 2)
+        self.assertNotIn('e09', {c['id'] for c in candidates})
         self.assertNotIn('e01', {c['id'] for c in candidates})
         self.assertNotIn('hr01', {c['id'] for c in candidates})
         with self.assertRaises(UserError):
-            self.store.activate(self.owner, token)
-        for employee in ('e02', 'e03', 'e09'):
+            self.store.toggle_colleague(self.owner, token, 'e09')
+        for employee in ('e02', 'e03', 'e04'):
             self.store.toggle_colleague(self.owner, token, employee)
-        self.store.toggle_colleague(self.owner, token, 'e03')
-        self.assertEqual({i['employee'] for i in self.store.invitations(token)}, {'e02', 'e09'})
-        self.store.toggle_colleague(self.owner, token, 'e04')
+        with self.assertRaises(UserError):
+            self.store.activate(self.owner, token)
+        self.store.toggle_colleague(self.owner, token, 'e02')
         self.store.activate(self.owner, token)
         with self.assertRaises(UserError):
-            self.store.toggle_colleague(self.owner, token, 'e05')
+            self.store.toggle_colleague(self.owner, token, 'e03')
+
+    def test_background_matching_creates_reviewable_draft_without_sending_invites(self):
+        bot = self.fake_bot()
+        snapshot = {'projects': [{'id': 'REAL', 'name': 'Общий проект'}],
+                    'memberships': [{'employee': e, 'project': 'REAL', 'sources': ['Jira']}
+                                    for e in ('e01', 'e02', 'e03', 'e04')]}
+        bot.matcher = SimpleNamespace(collect=lambda: snapshot)
+        bot.draft(self.owner)
+        user, token, error = bot.match_results.get(timeout=5)
+        self.assertEqual(user, self.owner)
+        self.assertIsNone(error)
+        self.assertEqual(self.store.campaign(token)['state'], 'draft')
+        bot.selection_card(user, token)
+        self.assertNotIn('Общий проект', bot.sent[-1][1])
+        self.assertNotIn('Jira + Jira', bot.sent[-1][1])
+        self.assertFalse(any(text.startswith('Приглашение оставить') for _, text, _ in bot.sent))
+
+    def test_pending_matching_blocks_messages_and_old_callbacks_only_for_requester(self):
+        bot = self.fake_bot()
+        token, _ = self.store.create(self.owner)
+        before = self.store.invitations(token)
+        bot.match_pending.add(self.owner)
+        for text in ('/start', 'Получить обратную связь', 'Оставить отзыв'):
+            bot.handle({'chat': {'type':'private'}, 'from':{'id':self.owner}, 'text':text})
+            self.assertTrue(bot.sent[-1][2]['remove_keyboard'])
+        calls = []
+        bot.api = lambda method, **payload: calls.append((method, payload))
+        bot.handle_callback({'id':'busy', 'from':{'id':self.owner}, 'message':{'chat':{'type':'private'}, 'message_id':9}, 'data':'toggle:' + token + ':e02'})
+        self.assertEqual(self.store.invitations(token), before)
+        self.assertIn('Дождитесь списка', calls[-1][1]['text'])
+        bot.handle({'chat': {'type':'private'}, 'from':{'id':self.users['e02']}, 'text':'/start'})
+        self.assertIn('keyboard', bot.sent[-1][2])
+        bot.match_pending.discard(self.owner)
+        bot.handle({'chat': {'type':'private'}, 'from':{'id':self.owner}, 'text':'/start'})
+        self.assertIn('keyboard', bot.sent[-1][2])
+
+    def test_background_matching_failure_does_not_create_survey(self):
+        bot = self.fake_bot()
+        def fail():
+            raise UserError('Нет доступа к Confluence.')
+        bot.matcher = SimpleNamespace(collect=fail)
+        bot.draft(self.owner)
+        user, token, error = bot.match_results.get(timeout=5)
+        self.assertIsNone(token)
+        self.assertEqual(error, 'Нет доступа к Confluence.')
+        self.assertEqual(self.store.visible(self.owner), [])
+
+    def test_ai_payload_preserves_explicit_question_numbers_when_skips_are_removed(self):
+        answer = [RATINGS[-1] if q['type'] == 'rating' else SKIP for q in QUESTIONNAIRE]
+        answer[-1] = 'Рекомендую предупреждать о рисках раньше.'
+        parsed = {'strengths': [], 'development': [], 'contradictions': [], 'advice': [
+            {'theme': 'Предупреждать о рисках раньше', 'evidence': [
+                {'response': 1, 'question': 50, 'quote': answer[-1]}]}]}
+        with patch('ai.request_json', return_value={'choices': [{'message': {'content': json.dumps(parsed)}}]}) as fetch:
+            report = generate_report([answer], ('http://local', 'fake-key', 'fake-model'))
+        payload = fetch.call_args.args[1]
+        data = json.loads(payload['messages'][1]['content'].split('\n/no_think')[0])
+        self.assertEqual(data['responses'][0]['answers'], [{'question': 50, 'answer': answer[-1]}])
+        self.assertEqual(data['questions'][-1]['question'], 50)
+        self.assertEqual(report['advice'][0]['count'], 1)
+
+    def test_rating_fallback_is_explicit_and_supported_by_exact_assessments(self):
+        rows = [[RATINGS[2] if q['type'] == 'rating' else SKIP for q in QUESTIONNAIRE] for _ in range(3)]
+        empty = {k: [] for k in ('strengths', 'development', 'advice', 'contradictions')}
+        self.assertTrue(add_rating_summary_if_empty(empty, rows, QUESTIONNAIRE))
+        report = validate_report(empty, rows)
+        self.assertEqual(report['strengths'], [])
+        self.assertTrue(all(item['count'] == 3 for item in report['development']))
+        report['rating_fallback'] = True
+        self.assertIn('подсчитаны программой', format_report({'subject': 'Тест', 'demo': True}, report, 3))
 
     def test_one_time_enrollment_cannot_choose_or_reuse_hr_role(self):
         tmp = Store(Path(self.tmp.name) / 'enrollment.sqlite3', FIXTURE)
@@ -99,7 +173,7 @@ class AssistantTests(unittest.TestCase):
         with self.assertRaises(UserError):
             self.store.report_data(self.owner, token)
         for i in range(2, len(QUESTIONS) + 1):
-            self.store.answer(self.users['e04'], 'Ответ на вопрос ' + str(i), i)
+            self.store.answer(self.users['e04'], DEMO_ANSWERS[0][i - 1], i)
         for allowed in (self.owner, self.hr):
             self.assertEqual(len(self.store.report_data(allowed, token)[1]), 3)
         with self.assertRaises(UserError):
@@ -111,8 +185,8 @@ class AssistantTests(unittest.TestCase):
         token = self.create_open()
         user = self.users['e02']
         self.store.begin(user, token)
-        self.assertEqual(self.store.answer(user, 'Первый ответ', 100), 1)
-        self.assertEqual(self.store.answer(user, 'Первый ответ', 100), 1)
+        self.assertEqual(self.store.answer(user, RATINGS[0], 100), 1)
+        self.assertEqual(self.store.answer(user, RATINGS[0], 100), 1)
         self.assertEqual(len(json.loads(self.store.session(user)['answers'])), 1)
         reloaded = Store(self.store.path)
         self.assertEqual(reloaded.answer(user, 'Второй ответ', 101), 2)
@@ -123,14 +197,14 @@ class AssistantTests(unittest.TestCase):
         ev = {'response': 1, 'question': 1, 'quote': 'Понятно объясняет сложные задачи'}
         report = {'strengths': [{'theme': 'Понятные объяснения', 'evidence': [ev, ev]}],
                   'development': [], 'advice': [], 'contradictions': []}
-        self.assertEqual(validate_report(report, DEMO_ANSWERS)['strengths'][0]['count'], 1)
+        self.assertEqual(validate_report(report, PREVIOUS_DEMO_ANSWERS)['strengths'][0]['count'], 1)
         report['strengths'][0]['evidence'] = [dict(ev, quote='Всегда выполняет задачи в срок')]
         with self.assertRaises(UserError):
-            validate_report(report, DEMO_ANSWERS)
+            validate_report(report, PREVIOUS_DEMO_ANSWERS)
         report['strengths'] = []
         report['contradictions'] = [{'theme': 'Противоположные мнения', 'evidence': [ev]}]
         with self.assertRaises(UserError):
-            validate_report(report, DEMO_ANSWERS)
+            validate_report(report, PREVIOUS_DEMO_ANSWERS)
 
     def test_insufficient_information_is_valid_and_reports_are_different(self):
         report = validate_report({'strengths': [], 'development': [], 'advice': [], 'contradictions': []}, DEMO_ANSWERS)
@@ -150,7 +224,7 @@ class AssistantTests(unittest.TestCase):
         token = self.store.visible(self.owner)[0]['id']
         buttons = bot.sent[-1][2]['inline_keyboard']
         self.assertTrue(any('Мария Иванова' in row[0]['text'] for row in buttons))
-        for employee in ('e02', 'e03', 'e04'):
+        for employee in ('e05', 'e06'):
             bot.action(self.owner, 'toggle', token + ':' + employee)
         bot.action(self.owner, 'launch', token)
         user = self.users['e02']
@@ -219,22 +293,65 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(len(due), 1)
         self.assertEqual(due[0]['delivery'], 'waiting')
 
-    def test_all_eight_questions_and_skip_button_preserve_incomplete_progress(self):
+    def test_corporate_questions_and_buttons_preserve_incomplete_progress(self):
         bot = self.fake_bot()
         token = self.create_open()
         user = self.users['e02']
         bot.action(user, 'accept', token)
-        self.assertIn('Качество работы', bot.sent[-1][1])
-        self.assertEqual(bot.sent[-1][2]['keyboard'][0][0]['text'], SKIP)
-        for i in range(1, 8):
+        self.assertIn('Общее впечатление', bot.sent[-1][1])
+        self.assertEqual(len(QUESTIONNAIRE), 50)
+        self.assertEqual(sum(q['type'] == 'rating' for q in QUESTIONNAIRE), 43)
+        self.assertEqual([r[0]['text'] for r in bot.sent[-1][2]['keyboard'][:-1]], list(RATINGS))
+        with self.assertRaises(UserError):
+            self.store.answer(user, 'Любой текст вместо оценки', 999)
+        self.assertEqual(json.loads(self.store.session(user)['answers']), [])
+        for i, q in enumerate(QUESTIONNAIRE[:-1], 1):
+            text = RATINGS[-1] if q['type'] == 'rating' else SKIP
             bot.handle({'chat': {'id': user, 'type': 'private'}, 'from': {'id': user},
-                        'text': SKIP, 'message_id': i})
-        self.assertEqual(len(self.store.responses(token)), 0)
-        self.assertEqual(len(json.loads(self.store.session(user)['answers'])), 7)
-        self.assertIn('Самостоятельность и развитие', bot.sent[-1][1])
+                        'text': text, 'message_id': i})
+        self.assertEqual(self.store.responses(token), [])
+        self.assertEqual(len(json.loads(self.store.session(user)['answers'])), 49)
+        self.assertEqual(bot.sent[-1][2]['keyboard'][0][0]['text'], SKIP)
         bot.handle({'chat': {'id': user, 'type': 'private'}, 'from': {'id': user},
-                    'text': SKIP, 'message_id': 8})
-        self.assertEqual(self.store.responses(token), [[SKIP] * 8])
+                    'text': SKIP, 'message_id': 50})
+        self.assertEqual(len(self.store.responses(token)[0]), 50)
+
+    def test_rating_evidence_and_computed_distribution(self):
+        answers = [[RATINGS[-1] if q['type'] == 'rating' else SKIP for q in QUESTIONNAIRE] for _ in range(3)]
+        empty = {k: [] for k in ('strengths', 'development', 'advice', 'contradictions')}
+        report = validate_report(empty, answers)
+        self.assertTrue(all(value == 0 for value in report['coverage'].values()))
+        answers[0][0] = RATINGS[2]
+        report = validate_report(empty, answers)
+        self.assertEqual(report['ratings']['Общее впечатление'][RATINGS[2]], 1)
+        empty['development'] = [{'theme': 'Есть сомнения в совместной работе', 'evidence': [
+            {'response': 1, 'question': 1, 'quote': RATINGS[2]}]}]
+        self.assertEqual(validate_report(empty, answers)['development'][0]['count'], 1)
+        empty['development'][0]['evidence'][0]['quote'] = 'согласен'
+        with self.assertRaises(UserError):
+            validate_report(empty, answers)
+        empty['development'][0]['evidence'][0]['quote'] = RATINGS[-1]
+        with self.assertRaises(UserError):
+            validate_report(empty, answers)
+        empty['development'][0]['evidence'][0]['quote'] = RATINGS[2]
+        empty['advice'] = empty['development']
+        empty['development'] = []
+        with self.assertRaises(UserError):
+            validate_report(empty, answers)
+
+    def test_existing_eight_question_snapshot_keeps_progress_after_restart(self):
+        token = self.create_open()
+        with self.store.connect() as db:
+            db.execute('UPDATE campaigns SET questionnaire=? WHERE id=?',
+                       (json.dumps(PREVIOUS_QUESTIONNAIRE, ensure_ascii=False), token))
+        user = self.users['e02']
+        self.store.begin(user, token)
+        self.store.answer(user, PREVIOUS_DEMO_ANSWERS[0][0], 1)
+        reloaded = Store(self.store.path)
+        for i, text in enumerate(PREVIOUS_DEMO_ANSWERS[0][1:], 2):
+            reloaded.answer(user, text, i)
+        self.assertEqual(reloaded.responses(token), [PREVIOUS_DEMO_ANSWERS[0]])
+        self.assertEqual(reloaded.campaign(token)['questions'], PREVIOUS_QUESTIONNAIRE)
 
     def test_skip_is_not_evidence_and_eighth_question_is_valid(self):
         empty = {k: [] for k in ('strengths', 'development', 'advice', 'contradictions')}
@@ -242,11 +359,11 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(list(report['coverage'].values()), [0, 0, 0, 0])
         empty['advice'] = [{'theme': 'Раньше сообщать о рисках', 'evidence': [
             {'response': 1, 'question': 8, 'quote': 'Рекомендую раньше сообщать о рисках.'}]}]
-        report = validate_report(empty, DEMO_ANSWERS)
+        report = validate_report(empty, PREVIOUS_DEMO_ANSWERS)
         self.assertEqual(report['advice'][0]['sections'], ['Самостоятельность и развитие'])
         empty['advice'][0]['evidence'] = [{'response': 1, 'question': 6, 'quote': SKIP}]
         with self.assertRaises(UserError):
-            validate_report(empty, DEMO_ANSWERS)
+            validate_report(empty, PREVIOUS_DEMO_ANSWERS)
 
     def test_legacy_three_question_survey_can_finish_after_update(self):
         token = self.create_open()

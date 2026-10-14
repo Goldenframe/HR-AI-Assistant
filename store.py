@@ -8,9 +8,10 @@ import sqlite3
 import time
 
 from helpers import UserError
-from survey import QUESTIONNAIRE, LEGACY_QUESTIONNAIRE
+from survey import QUESTIONNAIRE, LEGACY_QUESTIONNAIRE, RATINGS
 
 MIN_RESPONSES = 3
+REMINDER_DELAYS = (300, 3600, 10800, 86400, 172800, 604800)
 
 
 class Store:
@@ -45,10 +46,22 @@ class Store:
                 CREATE TABLE IF NOT EXISTS reports (
                     campaign TEXT PRIMARY KEY REFERENCES campaigns(id), count INTEGER, report TEXT);
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS reminders (
+                    campaign TEXT REFERENCES campaigns(id), employee TEXT REFERENCES employees(id),
+                    due REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(campaign,employee));
             ''')
+            employee_columns = {r['name'] for r in db.execute('PRAGMA table_info(employees)')}
+            if 'enabled' not in employee_columns:
+                db.execute('ALTER TABLE employees ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1')
             campaign_columns = {r['name'] for r in db.execute('PRAGMA table_info(campaigns)')}
             if 'questionnaire' not in campaign_columns:
                 db.execute('ALTER TABLE campaigns ADD COLUMN questionnaire TEXT')
+            if 'candidates' not in campaign_columns:
+                db.execute('ALTER TABLE campaigns ADD COLUMN candidates TEXT')
+            membership_columns = {r['name'] for r in db.execute('PRAGMA table_info(memberships)')}
+            if 'sources' not in membership_columns:
+                db.execute("ALTER TABLE memberships ADD COLUMN sources TEXT NOT NULL DEFAULT '[\"Демо\"]'")
             db.execute('UPDATE campaigns SET questionnaire=? WHERE questionnaire IS NULL',
                        (json.dumps(LEGACY_QUESTIONNAIRE, ensure_ascii=False),))
             columns = {r['name'] for r in db.execute('PRAGMA table_info(invitations)')}
@@ -67,7 +80,7 @@ class Store:
                 for p in data['projects']:
                     db.execute('INSERT INTO projects VALUES(?,?)', (p['id'], p['name']))
                     for member in p['members']:
-                        db.execute('INSERT INTO memberships VALUES(?,?)', (member, p['id']))
+                        db.execute('INSERT INTO memberships(employee,project) VALUES(?,?)', (member, p['id']))
 
     @contextmanager
     def connect(self):
@@ -84,7 +97,7 @@ class Store:
         """Issue new codes only for unbound profiles. Print them in the local console."""
         codes = []
         with self.connect() as db:
-            for e in db.execute('SELECT * FROM employees WHERE telegram_id IS NULL ORDER BY id').fetchall():
+            for e in db.execute('SELECT * FROM employees WHERE enabled=1 AND telegram_id IS NULL ORDER BY id').fetchall():
                 code = secrets.token_urlsafe(12)
                 db.execute('UPDATE employees SET enrollment_hash=? WHERE id=?',
                            (sha256(code.encode()).hexdigest(), e['id']))
@@ -95,7 +108,7 @@ class Store:
         with self.connect() as db:
             if db.execute('SELECT 1 FROM employees WHERE telegram_id=?', (user,)).fetchone():
                 raise UserError('Ваш аккаунт уже подключён.')
-            e = db.execute('SELECT * FROM employees WHERE enrollment_hash=? AND telegram_id IS NULL',
+            e = db.execute('SELECT * FROM employees WHERE enrollment_hash=? AND enabled=1 AND telegram_id IS NULL',
                            (sha256(code.strip().encode()).hexdigest(),)).fetchone()
             if not e:
                 raise UserError('Код не найден или уже использован. Получите код у организатора.')
@@ -105,7 +118,7 @@ class Store:
 
     def profile(self, user):
         with self.connect() as db:
-            e = db.execute('SELECT * FROM employees WHERE telegram_id=?', (user,)).fetchone()
+            e = db.execute('SELECT * FROM employees WHERE enabled=1 AND telegram_id=?', (user,)).fetchone()
         return dict(e) if e else None
 
     def require_profile(self, user):
@@ -116,25 +129,61 @@ class Store:
 
     def employees(self):
         with self.connect() as db:
-            return [dict(e) for e in db.execute('SELECT id,name,role,telegram_id FROM employees ORDER BY name')]
+            return [dict(e) for e in db.execute('SELECT id,name,role,telegram_id FROM employees WHERE enabled=1 ORDER BY name')]
 
     def peers(self, target):
         with self.connect() as db:
             rows = db.execute('''
-                SELECT e.id,e.name,e.telegram_id,p.name AS project,p.id AS project_id
+                SELECT e.id,e.name,e.telegram_id,p.name AS project,p.id AS project_id,
+                       own.sources AS own_sources,other.sources AS other_sources
                 FROM memberships own JOIN memberships other ON own.project=other.project
                 JOIN employees e ON e.id=other.employee JOIN projects p ON p.id=own.project
-                WHERE own.employee=? AND other.employee<>? AND e.role='employee'
+                WHERE own.employee=? AND other.employee<>? AND e.role='employee' AND e.enabled=1
                 ORDER BY e.name,p.name''', (target, target)).fetchall()
         people = {}
         for row in rows:
             peer = people.setdefault(row['id'], {'id': row['id'], 'name': row['name'],
-                                                 'telegram_id': row['telegram_id'], 'projects': []})
+                                                 'telegram_id': row['telegram_id'], 'projects': [], 'reasons': []})
             peer['projects'].append(row['project'])
+            peer['reasons'].append({'project': row['project'], 'key': row['project_id'],
+                                   'target_sources': json.loads(row['own_sources']),
+                                   'peer_sources': json.loads(row['other_sources'])})
         return sorted(people.values(), key=lambda p: (-len(p['projects']), p['name']))
 
     def candidates(self, target):
-        return [e for e in self.employees() if e['id'] != target and e['role'] == 'employee']
+        return self.peers(target)[:20]
+
+    def sync_participation(self, snapshot):
+        with self.connect() as db:
+            db.execute('DELETE FROM memberships')
+            for p in snapshot['projects']:
+                db.execute('INSERT INTO projects(id,name) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name',
+                           (p['id'], p['name']))
+            for member in snapshot['memberships']:
+                db.execute('INSERT INTO memberships(employee,project,sources) VALUES(?,?,?)',
+                           (member['employee'], member['project'], json.dumps(member['sources'], ensure_ascii=False)))
+            db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)', ('participation_updated', str(time.time())))
+
+    def sync_directory(self, directory):
+        with self.connect() as db:
+            existing = {row['id']: row['role'] for row in db.execute('SELECT id,role FROM employees')}
+            if directory.get('roster_source') == 'trck':
+                db.execute('UPDATE employees SET enabled=0, enrollment_hash=NULL')
+            for e in directory['employees']:
+                if e['id'] in existing and existing[e['id']] != e['role']:
+                    raise UserError('Роль существующего профиля изменилась в каталоге. Проверьте её с организатором.')
+                db.execute('INSERT INTO employees(id,name,role) VALUES(?,?,?) '
+                           'ON CONFLICT(id) DO UPDATE SET name=excluded.name,enabled=1', (e['id'], e['name'], e['role']))
+            if directory.get('roster_source') == 'trck':
+                db.execute("DELETE FROM invitations WHERE campaign IN (SELECT id FROM campaigns WHERE state='draft') AND employee IN (SELECT id FROM employees WHERE enabled=0)")
+
+    def campaign_candidates(self, token):
+        c = self.campaign(token)
+        # Old drafts keep explicitly selected recipients; launched surveys remain intact.
+        if c.get('candidates') is None:
+            return self.candidates(c['target'])
+        active = {e['id'] for e in self.employees()}
+        return [e for e in c['candidates'] if e['id'] in active]
 
     def create(self, user, target=None, selected=None):
         profile = self.require_profile(user)
@@ -142,16 +191,17 @@ class Store:
         if profile['role'] != 'hr' and target != profile['id']:
             raise UserError('Вы можете запрашивать обратную связь только о себе.')
         with self.connect() as db:
-            if not db.execute("SELECT 1 FROM employees WHERE id=? AND role='employee'", (target,)).fetchone():
+            if not db.execute("SELECT 1 FROM employees WHERE id=? AND role='employee' AND enabled=1", (target,)).fetchone():
                 raise UserError('Для опроса выберите профиль сотрудника.')
         candidates = self.candidates(target)
-        selected = set(selected or [])
+        selected = {e['id'] for e in candidates} if selected is None else set(selected)
         if not selected.issubset({e['id'] for e in candidates}):
             raise UserError('В списке есть недоступный сотрудник или сам получатель обратной связи.')
         token = secrets.token_urlsafe(18)
         with self.connect() as db:
-            db.execute('INSERT INTO campaigns(id,requester,target,questionnaire) VALUES(?,?,?,?)',
-                       (token, user, target, json.dumps(QUESTIONNAIRE, ensure_ascii=False)))
+            db.execute('INSERT INTO campaigns(id,requester,target,questionnaire,candidates) VALUES(?,?,?,?,?)',
+                       (token, user, target, json.dumps(QUESTIONNAIRE, ensure_ascii=False),
+                        json.dumps(candidates, ensure_ascii=False)))
             db.executemany('INSERT INTO invitations(campaign,employee) VALUES(?,?)',
                            [(token, e['id']) for e in candidates if e['id'] in selected])
         return token, candidates
@@ -160,7 +210,7 @@ class Store:
         c = self.controlled(user, token)
         if c['state'] != 'draft':
             raise UserError('После запуска изменить список коллег нельзя. Создайте новый опрос.')
-        if employee not in {e['id'] for e in self.candidates(c['target'])}:
+        if employee not in {e['id'] for e in self.campaign_candidates(token)}:
             raise UserError('Этого сотрудника нельзя выбрать в данном опросе.')
         with self.connect() as db:
             if db.execute('SELECT 1 FROM invitations WHERE campaign=? AND employee=?', (token, employee)).fetchone():
@@ -168,14 +218,88 @@ class Store:
             else:
                 db.execute('INSERT INTO invitations(campaign,employee) VALUES(?,?)', (token, employee))
 
+    def additional_colleagues(self, user, token, query=''):
+        c = self.controlled(user, token)
+        if c['state'] != 'draft':
+            raise UserError('Добавить коллег можно до запуска опроса.')
+        current = {e['id'] for e in self.campaign_candidates(token)}
+        return [e for e in self.employees() if e['role'] == 'employee' and e['id'] != c['target']
+                and e['id'] not in current and query.casefold() in e['name'].casefold()]
+
+    def set_all_colleagues(self, user, token, selected):
+        c = self.controlled(user, token)
+        if c['state'] != 'draft':
+            raise UserError('После запуска изменить список коллег нельзя. Создайте новый опрос.')
+        candidates = self.campaign_candidates(token)
+        with self.connect() as db:
+            if selected:
+                db.executemany('INSERT OR IGNORE INTO invitations(campaign,employee) VALUES(?,?)',
+                               [(token, e['id']) for e in candidates])
+            else:
+                db.execute('DELETE FROM invitations WHERE campaign=?', (token,))
+
+    def add_colleague(self, user, token, employee):
+        c = self.controlled(user, token)
+        if c['state'] != 'draft':
+            raise UserError('Добавить коллег можно до запуска опроса.')
+        person = next((e for e in self.employees() if e['id'] == employee and e['role'] == 'employee'
+                       and e['id'] != c['target']), None)
+        if not person:
+            raise UserError('Выберите сотрудника из каталога; нельзя добавить себя или профиль HR.')
+        candidates = self.campaign_candidates(token)
+        if employee not in {e['id'] for e in candidates}:
+            candidates.append({**person, 'projects': [], 'reasons': [], 'manual': True})
+        with self.connect() as db:
+            db.execute('UPDATE campaigns SET candidates=? WHERE id=?',
+                       (json.dumps(candidates, ensure_ascii=False), token))
+            db.execute('INSERT OR IGNORE INTO invitations(campaign,employee) VALUES(?,?)', (token, employee))
+
+    def schedule_reminder(self, user, token, seconds, now=None):
+        self.eligible(user, token)
+        if seconds not in REMINDER_DELAYS:
+            raise UserError('Выберите срок напоминания из предложенных вариантов.')
+        p = self.require_profile(user)
+        due = (time.time() if now is None else now) + seconds
+        with self.connect() as db:
+            db.execute('INSERT INTO reminders(campaign,employee,due,attempts) VALUES(?,?,?,0) '
+                       'ON CONFLICT(campaign,employee) DO UPDATE SET due=excluded.due,attempts=0',
+                       (token, p['id'], due))
+        return due
+
+    def cancel_reminder(self, user, token):
+        p = self.require_profile(user)
+        with self.connect() as db:
+            db.execute('DELETE FROM reminders WHERE campaign=? AND employee=?', (token, p['id']))
+
+    def due_reminders(self, now=None):
+        with self.connect() as db:
+            return [dict(r) for r in db.execute('''SELECT r.*,e.telegram_id,t.name AS subject
+                FROM reminders r JOIN employees e ON e.id=r.employee JOIN campaigns c ON c.id=r.campaign
+                JOIN employees t ON t.id=c.target WHERE r.due<=? AND r.attempts<5 AND c.state='open'
+                AND c.demo=0 AND e.enabled=1 AND e.telegram_id IS NOT NULL
+                AND EXISTS(SELECT 1 FROM invitations i WHERE i.campaign=r.campaign AND i.employee=r.employee)
+                AND NOT EXISTS(SELECT 1 FROM responses a WHERE a.campaign=r.campaign AND a.employee=r.employee)''',
+                (time.time() if now is None else now,))]
+
+    def reminder_delivered(self, token, employee, expected_due):
+        with self.connect() as db:
+            db.execute('DELETE FROM reminders WHERE campaign=? AND employee=? AND due=?',
+                       (token, employee, expected_due))
+
+    def reminder_failed(self, token, employee, expected_due, now=None):
+        with self.connect() as db:
+            db.execute('UPDATE reminders SET attempts=attempts+1,due=? WHERE campaign=? AND employee=? AND due=?',
+                       ((time.time() if now is None else now) + 60, token, employee, expected_due))
+
     def campaign(self, token):
         with self.connect() as db:
-            c = db.execute('''SELECT c.*,e.name AS subject FROM campaigns c
+            c = db.execute('''SELECT c.rowid AS number,c.*,e.name AS subject FROM campaigns c
                               JOIN employees e ON c.target=e.id WHERE c.id=?''', (token,)).fetchone()
         if not c:
             raise UserError('Опрос не найден.')
         result = dict(c)
         result['questions'] = json.loads(result.pop('questionnaire'))
+        result['candidates'] = json.loads(result['candidates']) if result.get('candidates') is not None else None
         return result
 
     def authorized(self, user, token):
@@ -208,7 +332,7 @@ class Store:
             rows = db.execute('''SELECT i.*,e.telegram_id,c.target,t.name AS subject
                 FROM invitations i JOIN campaigns c ON c.id=i.campaign
                 JOIN employees e ON e.id=i.employee JOIN employees t ON t.id=c.target
-                WHERE c.state='open' AND c.demo=0 AND e.telegram_id IS NOT NULL
+                WHERE c.state='open' AND c.demo=0 AND e.enabled=1 AND e.telegram_id IS NOT NULL
                 AND i.delivery IN ('pending','waiting','failed') AND i.attempts<5
                 AND NOT EXISTS(SELECT 1 FROM responses r
                                WHERE r.campaign=i.campaign AND r.employee=i.employee)
@@ -273,6 +397,7 @@ class Store:
             if db.execute('SELECT 1 FROM sessions WHERE user=?', (user,)).fetchone():
                 raise UserError('У вас есть незавершённый опрос. Продолжите его или нажмите «Отменить ответ».')
             db.execute('INSERT INTO sessions VALUES(?,?,?)', (user, token, '[]'))
+            db.execute('DELETE FROM reminders WHERE campaign=? AND employee=?', (token, self.require_profile(user)['id']))
         return c
 
     def session(self, user):
@@ -297,13 +422,18 @@ class Store:
                 return None
             if not 2 <= len(text.strip()) <= 1200:
                 raise UserError('Ответ должен содержать от 2 до 1200 символов.')
-            answers = json.loads(session['answers']) + [text.strip()]
+            questions = self.campaign(session['campaign'])['questions']
+            previous = json.loads(session['answers'])
+            if questions[len(previous)].get('type') == 'rating' and text.strip() not in RATINGS:
+                raise UserError('Выберите оценку кнопкой: ' + ', '.join(RATINGS) + '.')
+            answers = previous + [text.strip()]
             step = len(answers)
-            question_count = len(self.campaign(session['campaign'])['questions'])
+            question_count = len(questions)
             if step == question_count:
                 db.execute('INSERT INTO responses VALUES(?,?,?)',
                            (session['campaign'], profile['id'], json.dumps(answers, ensure_ascii=False)))
                 db.execute('DELETE FROM sessions WHERE user=?', (user,))
+                db.execute('DELETE FROM reminders WHERE campaign=? AND employee=?', (session['campaign'], profile['id']))
             else:
                 db.execute('UPDATE sessions SET answers=? WHERE user=?',
                            (json.dumps(answers, ensure_ascii=False), user))

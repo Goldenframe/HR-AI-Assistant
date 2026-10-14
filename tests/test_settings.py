@@ -37,6 +37,19 @@ class LocalSettingsTests(unittest.TestCase):
                 save_bot_token(path, '123:dummy\nAI_MODEL=injected')
             self.assertFalse(path.exists())
 
+    def test_atlassian_settings_loaded_locally_without_overriding_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / '.env'
+            path.write_text('TEAM_SOURCE=atlassian\nTEAM_DIRECTORY=data/team.json\nJIRA_URL=http://localhost:1\n'
+                            'JIRA_PERSONAL_TOKEN=local-test-key\nCONFLUENCE_URL=http://localhost:2\n'
+                            'CONFLUENCE_PERSONAL_TOKEN=other-test-key\n', encoding='utf-8')
+            with patch.dict(os.environ, {'JIRA_PERSONAL_TOKEN': 'external-test-key'}, clear=True):
+                load_local_env(path)
+                self.assertEqual(os.environ['TEAM_SOURCE'], 'atlassian')
+                self.assertEqual(os.environ['TEAM_DIRECTORY'], 'data/team.json')
+                self.assertEqual(os.environ['JIRA_PERSONAL_TOKEN'], 'external-test-key')
+                self.assertEqual(os.environ['CONFLUENCE_PERSONAL_TOKEN'], 'other-test-key')
+
 
 if __name__ == '__main__':
     unittest.main()

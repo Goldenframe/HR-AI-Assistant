@@ -1,0 +1,14 @@
+# Allow only the source files used in the demo image.
+*
+!Dockerfile
+!ai.py
+!atlassian.py
+!bot.py
+!helpers.py
+!store.py
+!survey.py
+!server.py
+!telegram_client.py
+!fixtures/
+fixtures/*
+!fixtures/team.json

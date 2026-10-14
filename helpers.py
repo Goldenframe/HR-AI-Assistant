@@ -5,8 +5,14 @@ from pathlib import Path
 import re
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 class UserError(Exception):
+    pass
+
+
+class JiraAccountError(UserError):
+    """Jira rejected a specific account in an otherwise valid search."""
     pass
 
 
@@ -15,7 +21,9 @@ def load_local_env(path):
     path = Path(path)
     if not path.is_file():
         return
-    allowed = {'TELEGRAM_BOT_TOKEN', 'AI_BASE_URL', 'AI_API_KEY', 'AI_MODEL', 'HERMES_CONFIG'}
+    allowed = {'TELEGRAM_BOT_TOKEN', 'AI_BASE_URL', 'AI_API_KEY', 'AI_MODEL', 'HERMES_CONFIG',
+               'TEAM_SOURCE', 'TEAM_DIRECTORY', 'DIRECTORY_SOURCE', 'TRCK_API_URL', 'JIRA_URL', 'JIRA_PERSONAL_TOKEN',
+               'CONFLUENCE_URL', 'CONFLUENCE_PERSONAL_TOKEN', 'TELEGRAM_USE_PROXY'}
     for line in path.read_text(encoding='utf-8-sig').splitlines():
         key, sep, value = line.strip().partition('=')
         if not sep or key.strip() not in allowed:
@@ -44,6 +52,17 @@ def save_bot_token(path, token):
 
 
 def request_json(url, payload=None, headers=None, timeout=40):
+    path = urlsplit(url).path
+    if '/rest/api/2/' in path:
+        service = 'Jira'
+    elif '/rest/api/' in path:
+        service = 'Confluence'
+    elif '/chat/completions' in path or '/models' in path:
+        service = 'Корпоративный ИИ'
+    elif urlsplit(url).hostname == 'trck.rdclr.ru':
+        service = 'Трекер TRCK'
+    else:
+        service = 'Сервис'
     data = None if payload is None else json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(url, data=data, headers={
         'Content-Type': 'application/json', **(headers or {})})
@@ -51,12 +70,26 @@ def request_json(url, payload=None, headers=None, timeout=40):
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
+        if service == 'Jira' and exc.code == 400:
+            try:
+                validation = json.loads(exc.read(65536))
+                messages = validation.get('errorMessages', [])
+                if isinstance(messages, list) and any(isinstance(message, str) and
+                        re.search(r"does not exist for the field '(assignee|reporter|worklogAuthor)'", message)
+                        for message in messages):
+                    raise JiraAccountError('Jira: аккаунт сотрудника не распознан в поиске проектов.') from None
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                pass
         # Never expose a Telegram URL (it contains the bot token) or response body.
-        raise UserError(f'Сервис вернул HTTP {exc.code}. Проверьте доступ и ключ.') from None
+        hint = ('Запрос отклонён: проверьте параметры запроса.' if exc.code == 400 else
+                'Проверьте доступ и ключ.' if exc.code in (401, 403) else
+                'Адрес или объект не найден.' if exc.code == 404 else
+                'Попробуйте позже или обратитесь к организатору.')
+        raise UserError(f'{service}: HTTP {exc.code}. {hint}') from None
     except (urllib.error.URLError, TimeoutError, OSError):
-        raise UserError('Не удалось связаться с сервисом. Проверьте интернет и Teleport.') from None
+        raise UserError(f'{service}: не удалось подключиться. Проверьте интернет и Teleport.') from None
     except (json.JSONDecodeError, UnicodeDecodeError):
-        raise UserError('Сервис вернул ответ в неожиданном формате. Проверьте адрес подключения.') from None
+        raise UserError(f'{service}: ответ в неожиданном формате. Проверьте адрес подключения.') from None
 
 
 def ai_settings():

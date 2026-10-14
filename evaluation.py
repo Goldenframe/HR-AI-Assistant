@@ -2,8 +2,8 @@
 import json
 from pathlib import Path
 import time
-from ai import generate_report, format_report
-from survey import SKIP
+from ai import generate_report, format_report, corporate_answers
+from survey import SKIP, QUESTIONNAIRE, RATINGS
 
 CASES = {
     'critical': [
@@ -21,6 +21,12 @@ CASES = {
               ['Всё нормально', SKIP, SKIP, SKIP, SKIP, SKIP, SKIP, SKIP]],
     'skipped': [[SKIP] * 8 for _ in range(3)],
 }
+CASES = {name: corporate_answers(rows) for name, rows in CASES.items()}
+def ratings_only(value):
+    return [value if q['type'] == 'rating' else SKIP for q in QUESTIONNAIRE]
+
+CASES['ratings_negative'] = [ratings_only(RATINGS[2]) for _ in range(3)]
+CASES['ratings_conflicting'] = [ratings_only(RATINGS[0]), ratings_only(RATINGS[2]), ratings_only(RATINGS[-1])]
 
 
 def evaluate(settings):
@@ -29,9 +35,9 @@ def evaluate(settings):
         started = time.monotonic()
         report = generate_report(answers, settings)
         # These assess concrete properties, not complete semantic accuracy.
-        if name == 'critical':
+        if name in ('critical', 'ratings_negative'):
             passed = not report['strengths'] and bool(report['development'])
-        elif name == 'conflicting':
+        elif name in ('conflicting', 'ratings_conflicting'):
             passed = bool(report['contradictions'])
         else:
             passed = not any(report.get(k) for k in ('strengths', 'development', 'advice', 'contradictions'))
