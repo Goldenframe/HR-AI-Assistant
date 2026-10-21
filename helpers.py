@@ -92,11 +92,24 @@ def request_json(url, payload=None, headers=None, timeout=40):
         raise UserError(f'{service}: ответ в неожиданном формате. Проверьте адрес подключения.') from None
 
 
+def _hermes_config_path():
+    if os.getenv('HERMES_CONFIG'):
+        return Path(os.getenv('HERMES_CONFIG'))
+    candidates = [
+        Path(os.getenv('LOCALAPPDATA', '')) / 'hermes' / 'config.yaml',
+        Path.home() / 'Library' / 'Application Support' / 'hermes' / 'config.yaml',
+        Path.home() / '.config' / 'hermes' / 'config.yaml',
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
+
+
 def ai_settings():
     url, key = os.getenv('AI_BASE_URL'), os.getenv('AI_API_KEY')
     if not (url and key):
-        config = Path(os.getenv('HERMES_CONFIG', str(
-            Path(os.getenv('LOCALAPPDATA', '')) / 'hermes' / 'config.yaml')))
+        config = _hermes_config_path()
         if not config.is_file():
             raise UserError('Не найден конфиг Hermes. Задайте AI_BASE_URL и AI_API_KEY.')
         # Read only the existing flat rc-ai block, without loading unrelated secrets.
