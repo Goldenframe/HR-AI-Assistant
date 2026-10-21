@@ -1,5 +1,5 @@
 import unittest
-from ai import REPORT_VERSION,validate_report,format_report,filter_supported_items
+from ai import REPORT_VERSION,validate_report,format_report,filter_supported_items,derive_values
 from helpers import UserError
 from survey import QUESTIONNAIRE,RATINGS,SKIP
 
@@ -58,3 +58,30 @@ class ReportQualityTests(unittest.TestCase):
         self.assertLess(len(text),1500)
         self.assertNotIn('Объяснение',text.split('Стоит уточнить')[0])
         self.assertEqual(text.count('Как проверить:'),2)
+
+    def test_values_are_derived_from_questionnaire_sections_not_model_guesses(self):
+        rows=self.rows();rows[0][0]=RATINGS[0];rows[0][2]=RATINGS[2]
+        # question 1 = Общее впечатление; question 3 = Коммуникация (ясность идей)
+        report=self.empty();report['version']=REPORT_VERSION
+        report['strengths']=[{'theme':'Понятно объясняет идеи','explanation':'Коллеги понимают формулировки и быстрее согласовывают решения.',
+            'evidence':[{'response':1,'question':1,'quote':RATINGS[0]}]}]
+        report['development']=[{'theme':'Идеи не всегда ясны','explanation':'Иногда сложно понять предложение; обсуждение затягивается.',
+            'action':'Перед встречей запишите решение и два аргумента.','check':'Спросите, какие вопросы остались.',
+            'evidence':[{'response':1,'question':3,'quote':RATINGS[2]}]}]
+        report['values']={'aligned':[{'value':'Учись у людей вокруг','themes':['Понятно объясняет идеи']}]}
+        valid=validate_report(report,rows)
+        self.assertEqual(valid['values']['aligned'],[{'value':'Взаимовыручка','themes':['Понятно объясняет идеи']}])
+        self.assertEqual(valid['values']['gaps'],[{'value':'Объединяй усилия','themes':['Идеи не всегда ясны']}])
+        text=format_report({'subject':'Тест','demo':False},valid,2)
+        self.assertIn('«Взаимовыручка»',text)
+        self.assertIn('«Объединяй усилия»',text)
+        self.assertNotIn('Учись у людей вокруг',text)
+        # Same value cannot be both a strength and a gap; second communication theme takes next title.
+        strengths=[{'theme':'Понятно объясняет','sections':['Коммуникация']}]
+        development=[{'theme':'Поздно о рисках','sections':['Организация работы']},
+                     {'theme':'Мало описаний в задачах','sections':['Коммуникация']}]
+        values=derive_values(strengths,development)
+        self.assertEqual(values['aligned'][0]['value'],'Объединяй усилия')
+        self.assertEqual(values['gaps'][0]['value'],'Бери ответственность')
+        self.assertEqual(values['gaps'][1]['value'],'Взаимовыручка')
+        self.assertEqual(len({item['value'] for item in values['aligned']+values['gaps']}),3)
