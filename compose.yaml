@@ -1,0 +1,33 @@
+services:
+  feedback-bot:
+    build: .
+    container_name: hr-ai-feedback-demo
+    restart: unless-stopped
+    init: true
+    # Linux server: reach host-local Teleport tunnels; no inbound ports are opened.
+    network_mode: host
+    env_file:
+      - path: .env.server
+        format: raw
+    environment:
+      TEAM_SOURCE: demo
+      PYTHONUNBUFFERED: "1"
+    command: ["python", "server.py"]
+    volumes:
+      - demo-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  demo-data:
